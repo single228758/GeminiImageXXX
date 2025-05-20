@@ -45,7 +45,7 @@ class GeminiImageXXX(PluginBase):
     
     description = "基于Google Gemini的图像生成插件"
     author = "Lingyuzhou (XXXBot移植版)"
-    version = "1.0.0"
+    version = "1.0.1"
     
     # 请求体大小限制常量（单位：字节）- 限制为4MB，避免413错误
     MAX_REQUEST_SIZE = 4 * 1024 * 1024
@@ -58,6 +58,8 @@ class GeminiImageXXX(PluginBase):
     SESSION_TYPE_REFERENCE = "reference" # 参考图编辑模式
     SESSION_TYPE_MERGE = "merge"        # 融图模式
     SESSION_TYPE_ANALYSIS = "analysis"   # 图片分析模式
+    
+    PAD_API_BASE_URL = "http://127.0.0.1:9011/api" # Base URL for Pad API calls
     
     def __init__(self):
         """初始化插件配置"""
@@ -1188,33 +1190,55 @@ class GeminiImageXXX(PluginBase):
         # 尝试读取图片数据
         image_data = None
         try:
-            # 首先尝试从Image字段获取图片路径
+            # 1. 尝试从Image字段获取图片路径 (通常是框架已下载的本地路径)
             image_path = message.get("Image")
             if image_path and os.path.exists(image_path):
                 with open(image_path, "rb") as f:
                     image_data = f.read()
-                logger.info(f"成功从路径读取图片数据: {image_path}，大小: {len(image_data)} 字节")
-            else:
-                # 尝试从消息中直接获取图片数据
-                image_content = message.get("Content")
-                if image_content and isinstance(image_content, str) and image_content.startswith("/9j/"):
+                logger.info(f"成功从本地路径读取图片数据: {image_path}，大小: {len(image_data)} 字节")
+            
+            # 2. 如果本地路径失败，尝试从消息内容中直接解码Base64
+            if not image_data:
+                content_value = message.get("Content")
+                if isinstance(content_value, str) and len(content_value) > 100: # 简单长度检查
+                    logger.debug(f"尝试从 message['Content'] (长度: {len(content_value)}) 解码Base64。")
                     try:
-                        # 看起来是base64编码的图片数据
-                        logger.debug("检测到base64编码的图片数据，直接解码")
-                        image_data = base64.b64decode(image_content)
-                        logger.info(f"base64图片数据解码成功，大小: {len(image_data)} 字节")
-                    except Exception as e:
-                        logger.error(f"base64图片数据解码失败: {e}")
+                        base64_str_to_decode = content_value
+                        # 处理 "data:image/...;base64," 前缀
+                        if "base64," in content_value:
+                            base64_str_to_decode = content_value.split("base64,", 1)[1]
+                        
+                        decoded_bytes = base64.b64decode(base64_str_to_decode)
+                        # 简单校验解码后的数据是否像图片 (例如，大于1KB)
+                        if len(decoded_bytes) > 1024: 
+                            image_data = decoded_bytes
+                            logger.info(f"成功从 message['Content'] 解码Base64图片数据，大小: {len(image_data)} 字节.")
+                        else:
+                            logger.warning(f"从 message['Content'] 解码Base64后数据过小 (大小: {len(decoded_bytes)}B)，可能不是有效的图片数据。")
+                    except (base64.binascii.Error, ValueError) as b64_error:
+                        logger.debug(f"message['Content'] Base64解码失败: {b64_error}. 内容可能不是Base64或格式不正确。")
+                    except Exception as e_direct_extract:
+                        logger.warning(f"直接从 message['Content'] 提取图片时发生未知错误: {e_direct_extract}")
+                        logger.debug(traceback.format_exc())
+
+            # 3. 如果以上都失败，尝试通过API下载图片
+            if not image_data:
+                logger.info("未能从本地路径或Content Base64获取图片，尝试通过API下载...")
+                image_data = await self._download_image_via_api(bot, message)
+                if image_data:
+                    logger.info(f"成功通过API下载图片数据，大小: {len(image_data)} 字节")
                 else:
-                    logger.warning(f"未能找到有效的图片数据，Image路径: {image_path}, Content长度: {len(image_content) if image_content else 0}")
-                    return True  # 没有图片数据，传递给其他插件
+                    logger.warning("通过API下载图片失败。")
+
         except Exception as e:
-            logger.error(f"读取图片数据失败: {e}")
-            return True  # 读取图片数据失败，传递给其他插件
+            logger.error(f"读取或下载图片数据过程中发生严重错误: {e}")
+            logger.exception(e)
+            # 不立即返回True，允许后续逻辑检查 image_data 是否为 None
         
         if not image_data:
-            logger.warning("未能获取图片数据")
-            return True  # 没有图片数据，传递给其他插件
+            logger.warning("最终未能获取图片数据。允许其他插件处理。")
+            await bot.send_text_message(message["FromWxid"], "无法获取您发送的图片，请稍后再试或联系管理员。")
+            return True # 确实没有图片数据，传递给其他插件
             
         # 缓存图片数据
         self.image_cache[conversation_key] = {
@@ -1896,53 +1920,104 @@ class GeminiImageXXX(PluginBase):
                 "Content-Type": "application/json"
             }
             
-            url = f"{self.base_url}/models/gemini-pro-vision:generateContent?key={self.api_key}"
+            # 根据配置决定使用直接调用还是通过代理服务调用
+            if self.use_proxy_service and self.proxy_service_url:
+                # 修改为最新的gemini-1.5-flash模型
+                url = f"{self.proxy_service_url.rstrip('/')}/v1beta/models/gemini-2.0-flash:generateContent?key={self.api_key}"
+                logger.info(f"使用代理服务URL: {url}")
+            else:
+                # 修改为最新的gemini-1.5-flash模型
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={self.api_key}"
+                logger.info(f"使用直接API URL: {url}")
             
             # 使用aiohttp发送请求
             async with aiohttp.ClientSession() as session:
                 # 配置代理
-                if self.enable_proxy and self.proxy_url:
-                    session_kwargs = {"proxy": self.proxy_url}
-                else:
-                    session_kwargs = {}
-                
-                # 使用代理服务
-                if self.use_proxy_service and self.proxy_service_url:
-                    url = f"{self.proxy_service_url}?url={urllib.parse.quote_plus(url)}"
-                    logger.info(f"使用代理服务，代理URL: {url}")
+                proxy = None
+                if self.enable_proxy and self.proxy_url and not self.use_proxy_service:
+                    proxy = self.proxy_url
+                    logger.info(f"使用HTTP代理: {proxy}")
                 
                 # 构建请求
                 request_body = json.dumps(payload)
                 
-                # 发送请求
-                async with session.post(url, headers=headers, data=request_body, **session_kwargs) as response:
-                    response_text = await response.text()
-                    
-                    if response.status == 200:
-                        try:
-                            result = json.loads(response_text)
+                # 添加重试逻辑
+                max_retries = 3
+                retry_count = 0
+                retry_delay = 1
+                
+                while retry_count <= max_retries:
+                    try:
+                        # 发送请求
+                        async with session.post(
+                            url, 
+                            headers=headers, 
+                            data=request_body,
+                            proxy=proxy,
+                            timeout=30
+                        ) as response:
+                            response_text = await response.text()
+                            logger.info(f"API响应状态码: {response.status}")
                             
-                            # 解析响应
-                            candidates = result.get("candidates", [])
-                            if candidates and len(candidates) > 0:
-                                content = candidates[0].get("content", {})
-                                parts = content.get("parts", [])
+                            if response.status == 200:
+                                try:
+                                    result = json.loads(response_text)
+                                    
+                                    # 解析响应
+                                    candidates = result.get("candidates", [])
+                                    if candidates and len(candidates) > 0:
+                                        content = candidates[0].get("content", {})
+                                        parts = content.get("parts", [])
+                                        
+                                        text_response = ""
+                                        for part in parts:
+                                            if "text" in part:
+                                                text_response += part["text"]
+                                        
+                                        return text_response
+                                    
+                                    logger.error(f"API响应中找不到有效内容: {response_text[:200]}")
+                                    return None
+                                except json.JSONDecodeError as e:
+                                    logger.error(f"解析API响应异常: {str(e)}, 响应内容: {response_text[:200]}")
+                                    
+                                    # 如果代理服务失败，尝试直接调用API
+                                    if self.use_proxy_service and retry_count < max_retries:
+                                        logger.warning("代理服务返回无效JSON，尝试直接调用API")
+                                        # 切换到直接API调用，使用新模型
+                                        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={self.api_key}"
+                                        logger.info(f"切换到直接API URL: {url}")
+                                        retry_count += 1
+                                        await asyncio.sleep(retry_delay)
+                                        retry_delay *= 2
+                                        continue
+                                    else:
+                                        return None
+                            elif response.status in [429, 500, 502, 503, 504] and retry_count < max_retries:
+                                # 服务器错误，重试
+                                logger.warning(f"服务器错误 {response.status}，正在重试 ({retry_count+1}/{max_retries})")
+                                retry_count += 1
+                                await asyncio.sleep(retry_delay)
+                                retry_delay *= 2
+                                continue
+                            else:
+                                logger.error(f"API调用失败 (状态码: {response.status}): {response_text[:200]}")
+                                return None
                                 
-                                text_response = ""
-                                for part in parts:
-                                    if "text" in part:
-                                        text_response += part["text"]
-                                
-                                return text_response
-                            
-                            logger.error(f"API响应中找不到有效内容: {response_text[:200]}")
+                    except Exception as req_error:
+                        logger.error(f"请求异常: {str(req_error)}")
+                        if retry_count < max_retries:
+                            logger.warning(f"请求异常，正在重试 ({retry_count+1}/{max_retries})")
+                            retry_count += 1
+                            await asyncio.sleep(retry_delay)
+                            retry_delay *= 2
+                            continue
+                        else:
+                            logger.error(f"请求失败，达到最大重试次数")
                             return None
-                        except json.JSONDecodeError as e:
-                            logger.error(f"解析API响应异常: {str(e)}, 响应内容: {response_text[:200]}")
-                            return None
-                    else:
-                        logger.error(f"API调用失败 (状态码: {response.status}): {response_text}")
-                        return None
+                
+                return None
+                
         except Exception as e:
             logger.error(f"分析图片异常: {str(e)}")
             logger.exception(e)
@@ -2391,3 +2466,80 @@ class GeminiImageXXX(PluginBase):
                     logger.debug(f"已清理临时图片文件: {image_path}")
         except Exception as e:
             logger.warning(f"清理临时图片文件时出错: {str(e)}")
+
+    async def _download_image_via_api(self, bot: WechatAPIClient, message: dict) -> Optional[bytes]:
+        """
+        通过Pad API (/Tools/DownloadImg) 下载图片。
+        """
+        msg_id = message.get("MsgId")
+        if not msg_id:
+            logger.warning("下载图片失败：消息中缺少 MsgId。")
+            return None
+
+        bot_wxid = getattr(bot, 'wxid', None) # 尝试获取机器人的Wxid
+        if not bot_wxid:
+            # 如果bot对象没有wxid属性，尝试从插件自身配置或状态中获取
+            # 这是一个潜在的需要根据实际bot对象结构调整的地方
+            # 例如: self.config.get('bot_wxid') 或其他方式
+            logger.warning("下载图片失败：无法获取机器人Wxid。请确保bot对象有wxid属性或配置了相关信息。")
+            # 作为临时方案，如果配置中有API Key（通常意味着是自己的账户），可以尝试使用FromWxid作为bot_wxid
+            # 但这不标准，取决于PAD协议的具体行为
+            # bot_wxid = message.get("FromWxid") # 不推荐，但作为最后的尝试
+            # if not bot_wxid:
+            return None
+
+
+        user_wxid = message.get("FromWxid") # 图片发送者
+        to_wxid = message.get("ToWxid") # 消息接收者 (可能是机器人自己，或群聊ID)
+        
+        # DataLen: 尝试从消息中获取，具体字段名可能因Pad版本而异
+        # 常见的可能是 "TotalLen", "FileSize", "Size", "length"
+        # API文档指定DataLen，但不清楚如果未知如何处理。
+        data_len = message.get("TotalLen", message.get("DataLen", message.get("length", 0)))
+        if data_len == 0:
+            logger.warning(f"MsgId {msg_id}: DataLen 未在消息中找到或为0，尝试无此参数或使用0。API行为可能不确定。")
+
+        payload = {
+            "Wxid": bot_wxid,
+            "ToWxid": user_wxid, # ToWxid for DownloadImg should be the sender of the image.
+            "MsgId": msg_id,
+            "DataLen": data_len # 如果API不需要或能自动处理，此参数可能不那么关键
+        }
+        # 有些PAD实现可能希望ToWxid是机器人自己，即使图片是用户发来的。
+        # 如果上述payload的ToWxid不工作，可以尝试:
+        # payload["ToWxid"] = bot_wxid 
+        # payload["FromWxid"] = user_wxid # 同时添加FromWxid字段
+
+        api_endpoint = f"{self.PAD_API_BASE_URL}/Tools/DownloadImg"
+        logger.info(f"尝试通过API下载图片: {api_endpoint}, Payload: {payload}")
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(api_endpoint, json=payload, timeout=30) as response:
+                    if response.status == 200:
+                        try:
+                            response_json = await response.json()
+                            if response_json.get("Success"):
+                                image_base64 = response_json.get("Data")
+                                if image_base64:
+                                    return base64.b64decode(image_base64)
+                                else:
+                                    logger.error(f"API下载图片成功，但响应中缺少 'Data' 字段。Response: {response_json}")
+                            else:
+                                error_msg = response_json.get("Msg", "未知错误")
+                                logger.error(f"API下载图片失败 (Success=false): {error_msg}. Response: {response_json}")
+                        except json.JSONDecodeError:
+                            resp_text = await response.text()
+                            logger.error(f"API下载图片响应JSON解析失败。Status: {response.status}, Response: {resp_text[:500]}")
+                        except Exception as e_json:
+                            logger.error(f"处理API下载图片响应时出错: {e_json}")
+                    else:
+                        resp_text = await response.text()
+                        logger.error(f"API下载图片请求失败。Status: {response.status}, Response: {resp_text[:500]}")
+        except aiohttp.ClientError as e_http:
+            logger.error(f"API下载图片网络请求错误: {e_http}")
+        except Exception as e:
+            logger.error(f"下载图片过程中发生未知异常: {e}")
+            logger.exception(e)
+        
+        return None
